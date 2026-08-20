@@ -24,7 +24,9 @@ pub async fn server(listener: TcpListener) -> Result<(), ServerError> {
         state.add_client(write_half, address).await;
         let welcome_message = format!("Welcome to the server, client {address}\n");
 
-        state.write_to_all_clients(welcome_message.as_bytes()).await;
+        state
+            .write_to_clients(welcome_message.as_bytes(), None)
+            .await;
 
         let client_state = state.clone();
         tokio::spawn(async move {
@@ -40,7 +42,7 @@ pub async fn server(listener: TcpListener) -> Result<(), ServerError> {
             let disconnect_message = format!("Client {address} disconnected\n");
             client_state.remove_client(address).await;
             client_state
-                .write_to_all_clients(disconnect_message.as_bytes())
+                .write_to_clients(disconnect_message.as_bytes(), None)
                 .await;
         });
     }

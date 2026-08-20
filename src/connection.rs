@@ -23,7 +23,7 @@ pub async fn handle_and_read_connection(
         }
 
         state
-            .write_to_clients(buffer.get(..n).unwrap_or_default(), address)
+            .write_to_clients(buffer.get(..n).unwrap_or_default(), Some(address))
             .await;
     }
 }

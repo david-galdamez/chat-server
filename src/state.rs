@@ -15,31 +15,22 @@ impl ServerState {
     }
 
     pub async fn add_client(&self, new_write_half: OwnedWriteHalf, address: SocketAddr) {
-        let clients = Arc::clone(&self.clients);
-        clients.lock().await.insert(address, new_write_half);
+        self.clients.lock().await.insert(address, new_write_half);
     }
 
-    pub async fn write_to_clients(&self, message: &[u8], client_address: SocketAddr) {
-        let clients = Arc::clone(&self.clients);
-        for (_, client) in clients
-            .lock()
-            .await
-            .iter_mut()
-            .filter(|(addr, _)| **addr != client_address)
-        {
-            let _ = client.write_all(message).await;
-        }
-    }
-
-    pub async fn write_to_all_clients(&self, message: &[u8]) {
-        let clients = Arc::clone(&self.clients);
-        for (_, client) in clients.lock().await.iter_mut() {
+    pub async fn write_to_clients(&self, message: &[u8], exclude: Option<SocketAddr>) {
+        for (_, client) in self.clients.lock().await.iter_mut().filter(|(addr, _)| {
+            if let Some(client_addr) = exclude {
+                client_addr != **addr
+            } else {
+                true
+            }
+        }) {
             let _ = client.write_all(message).await;
         }
     }
 
     pub async fn remove_client(&self, address: SocketAddr) {
-        let clients = Arc::clone(&self.clients);
-        clients.lock().await.remove(&address);
+        self.clients.lock().await.remove(&address);
     }
 }
