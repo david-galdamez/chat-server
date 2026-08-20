@@ -1,10 +1,10 @@
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
-use tokio::{io::AsyncWriteExt, net::tcp::OwnedWriteHalf, sync::Mutex};
+use tokio::sync::{Mutex, mpsc::UnboundedSender};
 
 #[derive(Debug, Clone)]
 pub struct ServerState {
-    clients: Arc<Mutex<HashMap<SocketAddr, OwnedWriteHalf>>>,
+    clients: Arc<Mutex<HashMap<SocketAddr, UnboundedSender<Vec<u8>>>>>,
 }
 
 impl ServerState {
@@ -14,19 +14,14 @@ impl ServerState {
         }
     }
 
-    pub async fn add_client(&self, new_write_half: OwnedWriteHalf, address: SocketAddr) {
-        self.clients.lock().await.insert(address, new_write_half);
+    pub async fn add_client(&self, sender: UnboundedSender<Vec<u8>>, address: SocketAddr) {
+        self.clients.lock().await.insert(address, sender);
     }
 
     pub async fn write_to_clients(&self, message: &[u8], exclude: Option<SocketAddr>) {
-        for (_, client) in self.clients.lock().await.iter_mut().filter(|(addr, _)| {
-            if let Some(client_addr) = exclude {
-                client_addr != **addr
-            } else {
-                true
-            }
-        }) {
-            let _ = client.write_all(message).await;
+        let clients = self.clients.lock().await.clone();
+        for (_, client) in clients.iter().filter(|(addr, _)| exclude != Some(**addr)) {
+            let _ = client.send(message.to_vec());
         }
     }
 
