@@ -12,7 +12,14 @@ pub async fn server(listener: TcpListener) -> Result<(), ServerError> {
     let state = ServerState::new();
 
     loop {
-        let (socket, address) = listener.accept().await?;
+        let (socket, address) = match listener.accept().await {
+            Ok(res) => res,
+            Err(e) => {
+                eprintln!("Error accepting connection: {e}");
+                continue;
+            }
+        };
+
         let (read_half, mut write_half) = socket.into_split();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
