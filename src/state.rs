@@ -13,8 +13,7 @@ use tokio::sync::{
     mpsc::{Sender, error::TrySendError},
 };
 
-/// A chunk of bytes queued for a single client's writer task.
-pub type ClientMessage = Vec<u8>;
+use crate::message::ServerMessage;
 
 /// Hands out a fresh id for every connection this process accepts.
 static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
@@ -49,7 +48,7 @@ pub struct Client {
     id: ClientId,
     address: SocketAddr,
     nickname: String,
-    sender: Sender<ClientMessage>,
+    sender: Sender<ServerMessage>,
 }
 
 impl Client {
@@ -58,7 +57,7 @@ impl Client {
         id: ClientId,
         address: SocketAddr,
         nickname: String,
-        sender: Sender<ClientMessage>,
+        sender: Sender<ServerMessage>,
     ) -> Self {
         Self {
             id,
@@ -119,7 +118,7 @@ impl ServerState {
     }
 
     /// Queues `message` for every connected client except `exclude`.
-    pub async fn broadcast(&self, message: &[u8], exclude: Option<ClientId>) {
+    pub async fn broadcast(&self, message: &ServerMessage, exclude: Option<ClientId>) {
         // Clone the registry so the lock is never held across a `try_send`,
         // and never held while `remove_client` takes it again below.
         let clients = self.clients.lock().await.clone();
@@ -137,7 +136,7 @@ impl ServerState {
     }
 
     /// Queues `message` for a single client.
-    pub async fn send_to(&self, id: ClientId, message: &[u8]) {
+    pub async fn send_to(&self, id: ClientId, message: &ServerMessage) {
         let client = self.clients.lock().await.get(&id).cloned();
 
         match client {
@@ -156,8 +155,8 @@ impl ServerState {
 /// Returns `false` when the client's channel is closed and the client should be
 /// dropped from the registry. A full channel means the client cannot keep up:
 /// the message is dropped, but the client stays connected.
-fn deliver(client: &Client, message: &[u8]) -> bool {
-    match client.sender.try_send(message.to_vec()) {
+fn deliver(client: &Client, message: &ServerMessage) -> bool {
+    match client.sender.try_send(message.clone()) {
         Ok(()) => true,
         Err(TrySendError::Full(_)) => {
             eprintln!(
@@ -173,6 +172,7 @@ fn deliver(client: &Client, message: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{Client, ClientId, ServerState, deliver};
+    use crate::message::ServerMessage;
     use std::net::SocketAddr;
     use tokio::sync::mpsc::{self, Sender};
 
@@ -180,7 +180,7 @@ mod tests {
         SocketAddr::from(([127, 0, 0, 1], port))
     }
 
-    fn client(nickname: &str, sender: Sender<Vec<u8>>) -> Client {
+    fn client(nickname: &str, sender: Sender<ServerMessage>) -> Client {
         Client::new(ClientId::next(), address(1), nickname.to_owned(), sender)
     }
 
@@ -245,9 +245,10 @@ mod tests {
         let excluded = client("bob", excluded_tx);
         state.add_client(excluded.clone()).await;
 
-        state.broadcast(b"hello\n", Some(excluded.id())).await;
+        let message = ServerMessage::chat("alice", "hello");
+        state.broadcast(&message, Some(excluded.id())).await;
 
-        assert_eq!(receiver.recv().await, Some(b"hello\n".to_vec()));
+        assert_eq!(receiver.recv().await, Some(message));
         assert!(excluded_rx.try_recv().is_err());
     }
 
@@ -261,9 +262,10 @@ mod tests {
         state.add_client(alice.clone()).await;
         state.add_client(client("bob", other_tx)).await;
 
-        state.send_to(alice.id(), b"just for you\n").await;
+        let message = ServerMessage::notice("just for you");
+        state.send_to(alice.id(), &message).await;
 
-        assert_eq!(receiver.recv().await, Some(b"just for you\n".to_vec()));
+        assert_eq!(receiver.recv().await, Some(message));
         assert!(other_rx.try_recv().is_err());
     }
 
@@ -275,7 +277,7 @@ mod tests {
 
         // The writer task going away is what closes the channel.
         drop(receiver);
-        state.broadcast(b"anyone there?\n", None).await;
+        state.broadcast(&ServerMessage::notice("anyone there?"), None).await;
 
         assert_eq!(state.client_count().await, 0);
     }
@@ -285,15 +287,18 @@ mod tests {
         let (sender, _receiver) = mpsc::channel(1);
         let alice = client("alice", sender);
 
-        assert!(deliver(&alice, b"first\n"));
+        assert!(deliver(&alice, &ServerMessage::notice("first")));
         // Capacity is 1 and nothing has been received yet.
-        assert!(deliver(&alice, b"second\n"));
+        assert!(deliver(&alice, &ServerMessage::notice("second")));
     }
 
     #[test]
     fn a_closed_channel_reports_the_client_as_gone() {
         let (sender, receiver) = mpsc::channel(1);
         drop(receiver);
-        assert!(!deliver(&client("alice", sender), b"anyone?\n"));
+        assert!(!deliver(
+            &client("alice", sender),
+            &ServerMessage::notice("anyone?")
+        ));
     }
 }

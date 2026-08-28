@@ -136,7 +136,7 @@ async fn a_message_reaches_the_other_client_but_not_its_sender() -> anyhow::Resu
     alice.send("hello everyone").await?;
 
     let received = bob.expect_line().await?;
-    anyhow::ensure!(received == "hello everyone", "got: {received}");
+    anyhow::ensure!(received == "alice: hello everyone", "got: {received}");
     alice.expect_silence().await?;
 
     server.stop().await
@@ -251,7 +251,7 @@ async fn many_clients_all_receive_a_broadcast() -> anyhow::Result<()> {
         // then the broadcast itself.
         loop {
             let line = listener.expect_line().await?;
-            if line == "broadcast to all" {
+            if line == "speaker: broadcast to all" {
                 break;
             }
             anyhow::ensure!(line.contains("joined the server"), "got: {line}");
@@ -274,7 +274,7 @@ async fn blank_lines_are_not_broadcast() -> anyhow::Result<()> {
 
     alice.send("still here").await?;
     let received = bob.expect_line().await?;
-    anyhow::ensure!(received == "still here", "got: {received}");
+    anyhow::ensure!(received == "alice: still here", "got: {received}");
 
     server.stop().await
 }
@@ -291,7 +291,7 @@ async fn carriage_returns_are_stripped_from_messages() -> anyhow::Result<()> {
     alice.write_half.write_all(b"from telnet\r\n").await?;
 
     let received = bob.expect_line().await?;
-    anyhow::ensure!(received == "from telnet", "got: {received}");
+    anyhow::ensure!(received == "alice: from telnet", "got: {received}");
 
     server.stop().await
 }
@@ -332,5 +332,40 @@ async fn an_over_long_line_disconnects_only_that_client() -> anyhow::Result<()> 
     anyhow::ensure!(left == "flooder left the server", "got: {left}");
 
     alice.send("still working").await?;
+    server.stop().await
+}
+
+#[tokio::test]
+async fn an_unknown_command_is_reported_to_its_sender_only() -> anyhow::Result<()> {
+    let mut server = TestServer::start().await?;
+    let mut alice = Client::connect(server.address, "alice").await?;
+    let mut bob = Client::connect(server.address, "bob").await?;
+
+    let _ = alice.expect_line().await?;
+
+    alice.send("/nick bobby").await?;
+
+    let reply = alice.expect_line().await?;
+    anyhow::ensure!(reply == "Unknown command: /nick", "got: {reply}");
+
+    // The command was not relayed to anyone else as chat.
+    bob.expect_silence().await?;
+
+    server.stop().await
+}
+
+#[tokio::test]
+async fn chat_lines_are_prefixed_with_the_sender_nickname() -> anyhow::Result<()> {
+    let mut server = TestServer::start().await?;
+    let mut alice = Client::connect(server.address, "alice").await?;
+    let mut bob = Client::connect(server.address, "bob").await?;
+
+    let _ = alice.expect_line().await?;
+
+    bob.send("hi from bob").await?;
+
+    let received = alice.expect_line().await?;
+    anyhow::ensure!(received == "bob: hi from bob", "got: {received}");
+
     server.stop().await
 }

@@ -10,7 +10,10 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::state::{Client, ClientId, ClientMessage, ServerState};
+use crate::{
+    message::{Command, ServerMessage},
+    state::{Client, ClientId, ServerState},
+};
 
 /// How many messages may queue for one client before we start dropping them.
 const CLIENT_BUFFER: usize = 100;
@@ -24,10 +27,6 @@ const MAX_LINE_BYTES: usize = 8 * 1024;
 
 /// Longest nickname a client may choose, in characters.
 const MAX_NICKNAME_CHARS: usize = 32;
-
-/// Terminated with a newline like every other line the server sends, so clients
-/// can stay strictly line-oriented.
-const NICKNAME_PROMPT: &[u8] = b"Enter your nickname:\n";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectionError {
@@ -74,7 +73,7 @@ pub async fn handle_connection(
     };
 
     let id = ClientId::next();
-    let (sender, receiver) = mpsc::channel::<ClientMessage>(CLIENT_BUFFER);
+    let (sender, receiver) = mpsc::channel::<ServerMessage>(CLIENT_BUFFER);
     let (writer_died_tx, writer_died_rx) = oneshot::channel();
 
     state
@@ -85,23 +84,33 @@ pub async fn handle_connection(
     println!("Client {id} ({nickname}) connected from {address}");
 
     state
-        .send_to(id, format!("Welcome to the server, {nickname}!\n").as_bytes())
-        .await;
-    state
-        .broadcast(
-            format!("{nickname} joined the server\n").as_bytes(),
-            Some(id),
+        .send_to(
+            id,
+            &ServerMessage::notice(format!("Welcome to the server, {nickname}!")),
         )
         .await;
+    state
+        .broadcast(&ServerMessage::joined(&nickname), Some(id))
+        .await;
 
-    let outcome = read_loop(&mut reader, &state, id, writer_died_rx, &mut shutdown).await;
+    let outcome = read_loop(
+        &mut reader,
+        &state,
+        id,
+        &nickname,
+        writer_died_rx,
+        &mut shutdown,
+    )
+    .await;
 
     match outcome {
         Ok(Disconnect::ServerShutdown) => {
             state
                 .send_to(
                     id,
-                    format!("Goodbye {nickname}, the server is shutting down\n").as_bytes(),
+                    &ServerMessage::notice(format!(
+                        "Goodbye {nickname}, the server is shutting down"
+                    )),
                 )
                 .await;
         }
@@ -112,7 +121,7 @@ pub async fn handle_connection(
         Err(ConnectionError::LineTooLong) => {
             eprintln!("Client {id} ({nickname}) dropped: line exceeded {MAX_LINE_BYTES} bytes");
             state
-                .send_to(id, b"Message too long, disconnecting\n")
+                .send_to(id, &ServerMessage::notice("Message too long, disconnecting"))
                 .await;
         }
         Err(ref e) => eprintln!("Error handling client {id} ({nickname}): {e}"),
@@ -123,9 +132,7 @@ pub async fn handle_connection(
     state.remove_client(id).await;
 
     if !matches!(outcome, Ok(Disconnect::ServerShutdown)) {
-        state
-            .broadcast(format!("{nickname} left the server\n").as_bytes(), None)
-            .await;
+        state.broadcast(&ServerMessage::left(&nickname), None).await;
     }
 
     // Wait for the queued bytes to reach the socket before we return, so a
@@ -146,12 +153,13 @@ async fn ask_for_nickname(
     shutdown: &mut broadcast::Receiver<()>,
 ) -> Result<Option<String>, ConnectionError> {
     loop {
-        write_half.write_all(NICKNAME_PROMPT).await?;
+        write_line(write_half, &ServerMessage::notice("Enter your nickname:")).await?;
 
         let line = tokio::select! {
             line = reader.next_line() => line?,
             _ = shutdown.recv() => {
-                let _ = write_half.write_all(b"Server is shutting down\n").await;
+                let goodbye = ServerMessage::notice("Server is shutting down");
+                let _ = write_line(write_half, &goodbye).await;
                 return Ok(None);
             }
         };
@@ -163,19 +171,22 @@ async fn ask_for_nickname(
         let nickname = String::from_utf8_lossy(&line).trim().to_owned();
 
         if nickname.is_empty() {
-            write_half
-                .write_all(b"A nickname cannot be empty.\n")
-                .await?;
+            write_line(
+                write_half,
+                &ServerMessage::notice("A nickname cannot be empty."),
+            )
+            .await?;
             continue;
         }
 
         if nickname.chars().count() > MAX_NICKNAME_CHARS {
-            write_half
-                .write_all(
-                    format!("A nickname can be at most {MAX_NICKNAME_CHARS} characters.\n")
-                        .as_bytes(),
-                )
-                .await?;
+            write_line(
+                write_half,
+                &ServerMessage::notice(format!(
+                    "A nickname can be at most {MAX_NICKNAME_CHARS} characters."
+                )),
+            )
+            .await?;
             continue;
         }
 
@@ -183,12 +194,13 @@ async fn ask_for_nickname(
     }
 }
 
-/// Reads messages from the client and broadcasts them, until the client leaves,
+/// Reads commands from the client and acts on them, until the client leaves,
 /// its writer dies, or the server shuts down.
 async fn read_loop(
     reader: &mut LineReader,
     state: &ServerState,
     id: ClientId,
+    nickname: &str,
     mut writer_died: oneshot::Receiver<()>,
     shutdown: &mut broadcast::Receiver<()>,
 ) -> Result<Disconnect, ConnectionError> {
@@ -197,8 +209,9 @@ async fn read_loop(
             line = reader.next_line() => {
                 match line? {
                     Some(line) => {
-                        if let Some(message) = normalize(line) {
-                            state.broadcast(&message, Some(id)).await;
+                        let line = String::from_utf8_lossy(&line);
+                        if let Some(command) = Command::parse(&line) {
+                            handle_command(command, state, id, nickname).await;
                         }
                     }
                     None => return Ok(Disconnect::Client),
@@ -206,6 +219,21 @@ async fn read_loop(
             }
             _ = &mut writer_died => return Ok(Disconnect::WriteFailed),
             _ = shutdown.recv() => return Ok(Disconnect::ServerShutdown),
+        }
+    }
+}
+
+async fn handle_command(command: Command, state: &ServerState, id: ClientId, nickname: &str) {
+    match command {
+        Command::Text(body) => {
+            state
+                .broadcast(&ServerMessage::chat(nickname, body), Some(id))
+                .await;
+        }
+        Command::Unknown { name } => {
+            state
+                .send_to(id, &ServerMessage::notice(format!("Unknown command: /{name}")))
+                .await;
         }
     }
 }
@@ -253,24 +281,12 @@ impl LineReader {
     }
 }
 
-/// Trims the line terminator a client sent (`\n` or `\r\n`) and re-appends a
-/// bare `\n`, so every broadcast line is terminated the same way.
-///
-/// Returns `None` for blank lines, which are not worth broadcasting.
-fn normalize(mut line: Vec<u8>) -> Option<ClientMessage> {
-    if line.ends_with(b"\n") {
-        line.pop();
-    }
-    if line.ends_with(b"\r") {
-        line.pop();
-    }
-
-    if line.is_empty() {
-        return None;
-    }
-
-    line.push(b'\n');
-    Some(line)
+/// Renders one message onto the socket, adding the line terminator.
+async fn write_line(
+    write_half: &mut OwnedWriteHalf,
+    message: &ServerMessage,
+) -> std::io::Result<()> {
+    write_half.write_all(format!("{message}\n").as_bytes()).await
 }
 
 /// Owns the client's write half and drains its queue onto the socket.
@@ -278,13 +294,13 @@ fn normalize(mut line: Vec<u8>) -> Option<ClientMessage> {
 /// Signals `died` if a write fails, so the read side knows to give up too.
 fn spawn_writer(
     mut write_half: OwnedWriteHalf,
-    mut receiver: mpsc::Receiver<ClientMessage>,
+    mut receiver: mpsc::Receiver<ServerMessage>,
     id: ClientId,
     died: oneshot::Sender<()>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(message) = receiver.recv().await {
-            if let Err(e) = write_half.write_all(&message).await {
+            if let Err(e) = write_line(&mut write_half, &message).await {
                 eprintln!("Error writing to client {id}: {e}");
                 let _ = died.send(());
                 return;
@@ -295,26 +311,4 @@ fn spawn_writer(
         // close our side of the socket cleanly.
         let _ = write_half.shutdown().await;
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::normalize;
-
-    #[test]
-    fn a_newline_terminated_line_is_left_alone() {
-        assert_eq!(normalize(b"hello\n".to_vec()), Some(b"hello\n".to_vec()));
-    }
-
-    #[test]
-    fn a_carriage_return_is_stripped() {
-        assert_eq!(normalize(b"hello\r\n".to_vec()), Some(b"hello\n".to_vec()));
-    }
-
-    #[test]
-    fn blank_lines_are_dropped() {
-        assert_eq!(normalize(b"\n".to_vec()), None);
-        assert_eq!(normalize(b"\r\n".to_vec()), None);
-        assert_eq!(normalize(Vec::new()), None);
-    }
 }
