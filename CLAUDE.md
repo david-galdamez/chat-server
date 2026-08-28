@@ -62,6 +62,18 @@ connect and test manually during development.
 
 ## Project status
 
-Initial scaffold (`cargo new`), no dependencies added yet, no logic
-implemented. User is about to add dependencies (tokio) and make the
-initial commit.
+Core is working: accept loop, per-client reader + writer tasks, broadcast
+via per-client `mpsc` senders in a shared registry, newline framing,
+disconnect handling, and graceful shutdown on Ctrl-C.
+
+Layout: `main.rs` (binary) is thin; `lib.rs` exposes `server` (accept loop
++ shutdown), `connection` (per-client lifecycle), and `state` (client
+registry). Tests live in `src/state.rs` (unit) and `tests/chat.rs`
+(end-to-end over real sockets).
+
+Next up are the extensions listed above (nicks, commands, rooms, history).
+
+`cargo clippy --all-targets` must stay clean — the lint config in
+`Cargo.toml` denies panics, `unwrap`, and indexing. In tests that return
+`Result`, use `anyhow::ensure!` rather than `assert!`/`assert_eq!`, which
+trip `clippy::panic_in_result_fn`.
